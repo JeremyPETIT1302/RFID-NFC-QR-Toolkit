@@ -54,6 +54,8 @@
 #define WM_APP_donnee  (WM_APP + 2) // Message pour mettre à jour l'affichage de l'index de donnée courante
 #define WM_APP_DONE  (WM_APP + 3)   // Message indiquant l'arrêt du processus de lecture/écriture
 
+static void post_log(const char *fmt, ...);
+
 /* --- POLICE D'ÉCRITURE PIXEL ART 8x8 (ASCII 32 à 127) --- */
 static const uint8_t font8x8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},{0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},{0x66,0x66,0x66,0x00,0x00,0x00,0x00,0x00},{0x6C,0x6C,0xFE,0x6C,0xFE,0x6C,0x6C,0x00},
@@ -291,15 +293,24 @@ static BOOL g_readerReady = FALSE;
  * Initialise le contexte API et recherche le premier lecteur disponible branché au PC.
  */
 static BOOL init_pcsc(void) {
+    if (g_hContext) {
+        SCardReleaseContext(g_hContext);
+        g_hContext = 0;
+    }
+
     LONG rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &g_hContext);
     if (rv != SCARD_S_SUCCESS) return FALSE;
 
     char readers[1024];
     DWORD readersLen = sizeof(readers);
     rv = SCardListReaders(g_hContext, NULL, readers, &readersLen);
-    if (rv != SCARD_S_SUCCESS) return FALSE;
+    if (rv != SCARD_S_SUCCESS || readersLen <= 2) {
+        g_readerName[0] = '\0';
+        return FALSE;
+    }
 
-    strncpy(g_readerName, readers, sizeof(g_readerName) - 1); // Sélectionne le lecteur primaire
+    strncpy(g_readerName, readers, sizeof(g_readerName) - 1);
+    g_readerName[sizeof(g_readerName) - 1] = '\0';
     return TRUE;
 }
 
@@ -343,27 +354,60 @@ static int read_page(SCARDHANDLE hCard, BYTE page, BYTE out4[4]) {
  * Permet l'interruption logicielle externe via l'écoute de "stopFlag".
  */
 static SCARDHANDLE wait_for_card_i(volatile BOOL *stopFlag) {
+    // Si aucun lecteur n'est initialisé ou détecté, on cherche en boucle
+    while (!*stopFlag) {
+        if (g_readerName[0] == '\0' || !g_hContext) {
+            if (init_pcsc()) {
+                post_log("Lecteur détecté : %s", g_readerName);
+                break;
+            }
+            Sleep(POLL_MS);
+            continue;
+        }
+        break;
+    }
+    if (*stopFlag) return 0;
+
     SCARD_READERSTATE state;
     memset(&state, 0, sizeof(state));
     state.szReader = g_readerName;
-    state.dwCurrentState = SCARD_STATE_EMPTY;
+    state.dwCurrentState = SCARD_STATE_UNAWARE;
 
-    // Boucle d'attente
     while (!*stopFlag) {
         LONG rv = SCardGetStatusChange(g_hContext, POLL_MS, &state, 1);
-        if (rv == (LONG)SCARD_E_TIMEOUT) continue; // Si timeout normal atteint, on reboucle
-        if (rv != SCARD_S_SUCCESS) return 0;
-        if (state.dwEventState & SCARD_STATE_PRESENT) break; // Un tag a été présenté !
+        
+        // Si le lecteur a été déconnecté physiquement en cours de route
+        if (rv == (LONG)SCARD_E_NO_READERS_AVAILABLE || rv == (LONG)SCARD_E_UNKNOWN_READER || rv == (LONG)SCARD_E_SERVICE_STOPPED) {
+            post_log("Lecteur déconnecté. En attente d'un lecteur...");
+            g_readerName[0] = '\0';
+            while (!*stopFlag) {
+                if (init_pcsc()) {
+                    post_log("Lecteur reconnecté : %s", g_readerName);
+                    state.szReader = g_readerName;
+                    state.dwCurrentState = SCARD_STATE_UNAWARE;
+                    break;
+                }
+                Sleep(POLL_MS);
+            }
+            continue;
+        }
+
+        if (rv == (LONG)SCARD_E_TIMEOUT) continue;
+        if (rv != SCARD_S_SUCCESS) {
+            Sleep(POLL_MS);
+            continue;
+        }
+
+        if (state.dwEventState & SCARD_STATE_PRESENT) break;
         state.dwCurrentState = state.dwEventState;
     }
     if (*stopFlag) return 0;
 
-    // Négocie la connexion avec le protocole de la carte (T=0 ou T=1)
-    SCARDHANDLE hCard;
+    SCARDHANDLE hCard = 0;
     DWORD activeProtocol;
     LONG rv = SCardConnect(g_hContext, g_readerName, SCARD_SHARE_SHARED,
-                            SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
-                            &hCard, &activeProtocol);
+                           SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
+                           &hCard, &activeProtocol);
     if (rv != SCARD_S_SUCCESS) return 0;
     return hCard;
 }
@@ -959,13 +1003,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         }
                     }
 
-                    // Ne lance pas la mécanique si aucun périphérique compatible détecté
-                    if (!g_readerReady) {
-                        MessageBox(hwnd, "Aucun lecteur détecté. Branchez un lecteur RFID PC/SC compatible.",
-                                   "Erreur", MB_OK | MB_ICONERROR);
-                        return 0;
-                    }
-
+                    
                     // Allumage du thread et verrouillage Interface
                     g_stopRequested = FALSE;
                     g_isRunning = TRUE;
@@ -1133,13 +1171,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(g_hWndMain, nCmdShow);
     UpdateWindow(g_hWndMain);
 
-    // Pop-up d'alerte si l'utilisateur lance le soft sans avoir branché l'ACR122U
-    if (!g_readerReady) {
-        MessageBox(g_hWndMain, "Aucun lecteur détecte au démarrage.\nBranchez un lecteur RFID PC/SC compatible et redémarrez.",
-                   "Lecteur introuvable", MB_OK | MB_ICONWARNING);
-    } else {
-        post_log("Lecteur détecté : %s", g_readerName);
-    }
+
+
+if (g_readerReady) {
+    post_log("Lecteur détecté : %s", g_readerName);
+} else {
+    post_log("Aucun lecteur détecté. Branchez votre lecteur RFID à tout moment.");
+}
     if (g_csv.count > 0) post_log("Fichier rechargé : %d données.", g_csv.count);
 
     /* --- MESSAGE PUMP (Coeur de Réactivité Windows) --- */
